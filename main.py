@@ -21,9 +21,9 @@ from flask import Flask, request
 # ===== КОНФИГУРАЦИЯ =====
 class Config:
     # Токены (заполнить в Secrets Replit)
-    TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
-    ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', 0))
-    MANAGER_USER_IDS = [int(uid) for uid in os.getenv('MANAGER_USER_IDS', '').split(',') if uid]
+    TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '8162445495:AAE5E9FxE5GXL7h-2rLOGXObw6hz5U4D84c')
+    ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', 8042351960))
+    MANAGER_USER_IDS = [int(uid) for uid in os.getenv('MANAGER_USER_IDS', '8042351960').split(',') if uid]
 
     # Настройки бизнеса
     BUSINESS_NAME = "Create AI Bot"
@@ -918,4 +918,5 @@ async def main():
         await application.run_polling()
 
 if __name__ == "__main__":
+
     asyncio.run(main())
