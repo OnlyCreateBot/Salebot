@@ -16,7 +16,9 @@ from telegram.ext import (
     CallbackContext
 )
 from telegram.constants import ParseMode
-from flask import Flask, request
+from flask import Flask, request, jsonify, render_template_string
+import threading
+from urllib.parse import urlparse
 
 # ===== КОНФИГУРАЦИЯ =====
 class Config:
@@ -35,16 +37,29 @@ class Config:
     DB_NAME = "leads.db"
 
     # Настройки сервера
-    PORT = int(os.getenv('PORT', 8080))
+    PORT = int(os.getenv('PORT', 10000))  # Render использует PORT из env
     REMINDER_INTERVAL = 86400  # 24 часа в секундах
+    
+    # Настройки для пинга (предотвращение засыпания на Render Free)
+    PING_INTERVAL = 840  # 14 минут (Render засыпает через 15 минут)
+    PING_URL = os.getenv('RENDER_EXTERNAL_URL', 'https://your-app.onrender.com')
+    ENABLE_PING = True  # Включить автопинг
 
     @staticmethod
     def get_webhook_url():
-        """Получение URL для вебхука в Replit"""
+        """Получение URL для вебхука"""
         try:
-            repl_owner = os.environ.get('REPL_OWNER', 'unknown')
-            repl_slug = os.environ.get('REPL_SLUG', 'unknown')
-            return f"https://{repl_slug}.{repl_owner}.repl.co"
+            # Для Render
+            if os.getenv('RENDER_EXTERNAL_URL'):
+                return os.getenv('RENDER_EXTERNAL_URL')
+            
+            # Для Replit
+            repl_owner = os.environ.get('REPL_OWNER')
+            repl_slug = os.environ.get('REPL_SLUG')
+            if repl_owner and repl_slug:
+                return f"https://{repl_slug}.{repl_owner}.repl.co"
+                
+            return "https://your-domain.com"
         except:
             return "https://your-domain.com"
 
@@ -847,8 +862,50 @@ async def send_reminders(context: CallbackContext):
     except Exception as e:
         logger.error(f"Ошибка в задаче напоминаний: {e}")
 
+# ===== СИСТЕМА АВТОПИНГА =====
+def ping_self():
+    """Пингует сам себя для предотвращения засыпания на Render Free"""
+    if not Config.ENABLE_PING:
+        return
+        
+    try:
+        ping_url = Config.PING_URL
+        if ping_url == 'https://your-app.onrender.com':
+            logger.warning("PING_URL не настроен. Установите RENDER_EXTERNAL_URL в переменных окружения.")
+            return
+            
+        response = requests.get(f"{ping_url}/health", timeout=30)
+        if response.status_code == 200:
+            logger.info(f"🏓 Пинг успешен: {ping_url}")
+        else:
+            logger.warning(f"🏓 Пинг неудачен: {response.status_code}")
+    except Exception as e:
+        logger.error(f"🏓 Ошибка пинга: {e}")
+
+async def ping_job(context: CallbackContext):
+    """Задача для регулярного пинга"""
+    ping_self()
+
+def start_ping_system():
+    """Запуск системы пинга в отдельном потоке"""
+    if not Config.ENABLE_PING:
+        return
+        
+    def ping_loop():
+        while True:
+            try:
+                time.sleep(Config.PING_INTERVAL)
+                ping_self()
+            except Exception as e:
+                logger.error(f"Ошибка в цикле пинга: {e}")
+                time.sleep(60)  # Ждем минуту перед повторной попыткой
+    
+    ping_thread = threading.Thread(target=ping_loop, daemon=True)
+    ping_thread.start()
+    logger.info(f"🏓 Система автопинга запущена (интервал: {Config.PING_INTERVAL} сек)")
+
 # ===== ЗАПУСК СЕРВЕРА =====
-async def main():
+def main():
     if not Config.TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN не установлен! Добавьте его в Secrets.")
         return
@@ -875,7 +932,7 @@ async def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Напоминания
-    if application.job_queue:
+    if hasattr(application, 'job_queue') and application.job_queue:
         try:
             application.job_queue.run_repeating(
                 send_reminders,
@@ -886,37 +943,112 @@ async def main():
         except Exception as e:
             logger.warning(f"Не удалось настроить напоминания: {e}")
 
-    # Запуск бота
-    try:
+    # Создаем Flask приложение для preview
+    app = Flask(__name__)
+    
+    @app.route('/')
+    def home():
+        stats = db.get_stats()
         webhook_url = Config.get_webhook_url()
-        logger.info(f"Запуск бота с вебхуком: {webhook_url}")
         
-        # Устанавливаем вебхук
-        await application.bot.set_webhook(url=f"{webhook_url}/webhook")
+        html_template = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>{{business_name}} - Telegram Bot Status</title>
+            <meta charset="utf-8">
+            <style>
+                body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+                .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                h1 { color: #2c3e50; text-align: center; }
+                .status { background: #27ae60; color: white; padding: 10px; border-radius: 5px; text-align: center; margin: 20px 0; }
+                .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }
+                .stat-card { background: #ecf0f1; padding: 20px; border-radius: 8px; text-align: center; }
+                .stat-number { font-size: 2em; font-weight: bold; color: #3498db; }
+                .stat-label { color: #7f8c8d; margin-top: 5px; }
+                .info { background: #e8f4f8; padding: 15px; border-radius: 5px; margin: 20px 0; }
+                .url { background: #34495e; color: white; padding: 10px; border-radius: 5px; font-family: monospace; word-break: break-all; }
+            </style>
+            <meta http-equiv="refresh" content="30">
+        </head>
+        <body>
+            <div class="container">
+                <h1>🤖 {{business_name}}</h1>
+                <div class="status">✅ Бот работает в Telegram</div>
+                
+                <div class="info">
+                    <h3>📊 Статистика бота:</h3>
+                    <div class="stats">
+                        <div class="stat-card">
+                            <div class="stat-number">{{stats.total_requests}}</div>
+                            <div class="stat-label">Всего заявок</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number">{{stats.new_requests}}</div>
+                            <div class="stat-label">Новые заявки</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number">{{stats.total_questions}}</div>
+                            <div class="stat-label">Всего вопросов</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number">{{stats.active_managers}}</div>
+                            <div class="stat-label">Менеджеров</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="info">
+                    <h3>🌐 URL вашего приложения:</h3>
+                    <div class="url">{{webhook_url}}</div>
+                    <p><small>🏓 Автопинг активен для предотвращения засыпания</small></p>
+                </div>
+                
+                <div class="info">
+                    <h3>📱 Как использовать бота:</h3>
+                    <p>1. Найдите бота в Telegram по токену</p>
+                    <p>2. Отправьте команду /start</p>
+                    <p>3. Используйте кнопки меню для взаимодействия</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
         
-        # Создаем Flask приложение для обработки вебхуков
-        app = Flask(__name__)
-        
-        @app.route('/webhook', methods=['POST'])
-        def webhook():
-            json_data = request.get_json()
-            update = Update.de_json(json_data, application.bot)
-            asyncio.create_task(application.process_update(update))
-            return 'OK'
-        
-        @app.route('/', methods=['GET'])
-        def health_check():
-            return f'Bot is running! Webhook URL: {webhook_url}/webhook'
-        
-        # Запускаем Flask
-        app.run(host='0.0.0.0', port=Config.PORT)
-        
-    except Exception as e:
-        logger.error(f"Ошибка запуска бота: {e}")
-        # Fallback к polling если вебхук не работает
-        logger.info("Переключение на polling режим...")
-        await application.run_polling()
+        return render_template_string(html_template, 
+                                    business_name=Config.BUSINESS_NAME,
+                                    stats=stats,
+                                    webhook_url=webhook_url)
+    
+    @app.route('/api/stats')
+    def api_stats():
+        stats = db.get_stats()
+        return jsonify(stats)
+    
+    @app.route('/health')
+    def health():
+        return jsonify({"status": "ok", "bot": "running"})
+
+    # Запуск системы автопинга
+    start_ping_system()
+    
+    # Запуск Flask в отдельном потоке
+    def run_flask():
+        app.run(host='0.0.0.0', port=Config.PORT, debug=False)
+    
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    
+    # Запуск бота в polling режиме
+    webhook_url = Config.get_webhook_url()
+    logger.info(f"🌐 Веб-интерфейс: {webhook_url}")
+    logger.info(f"🏓 Автопинг: {'Включен' if Config.ENABLE_PING else 'Отключен'}")
+    logger.info(f"🤖 Telegram бот запускается...")
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
 
 if __name__ == "__main__":
-
-    asyncio.run(main())
+    main()

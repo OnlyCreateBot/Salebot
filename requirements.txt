@@ -1,3 +1,5 @@
 python-telegram-bot==20.3
 requests
 gpt4free
+flask
+telegram
